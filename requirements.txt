@@ -1,4 +1,4 @@
 python-telegram-bot[job-queue]==20.7
 aiohttp==3.9.5
 whois==0.8.0
-dnspython==2.6.1
+dnspython==2.6.1 
