@@ -3,12 +3,10 @@ import re
 import socket
 import hashlib
 import urllib.parse
-import tempfile
 import json
 import logging
 import asyncio
-from datetime import datetime, timedelta
-from typing import Dict, Optional
+from datetime import datetime
 
 import aiohttp
 import whois
@@ -35,6 +33,7 @@ NUMVERIFY_KEY = os.environ.get("NUMVERIFY_KEY", "")
 SHODAN_KEY = os.environ.get("SHODAN_KEY", "")
 VIRUSTOTAL_KEY = os.environ.get("VIRUSTOTAL_KEY", "")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+HIBP_API_KEY = os.environ.get("HIBP_API_KEY", "")
 
 # ========== LOGS ==========
 logging.basicConfig(
@@ -42,21 +41,6 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
-
-# ========== CACHÉ (opcional) ==========
-cache: Dict[str, Dict] = {}
-CACHE_TTL = 300  # 5 minutos
-
-def get_cache(key: str) -> Optional[Dict]:
-    if key in cache:
-        data, timestamp = cache[key]
-        if datetime.now() - timestamp < timedelta(seconds=CACHE_TTL):
-            return data
-        del cache[key]
-    return None
-
-def set_cache(key: str, data: Dict):
-    cache[key] = (data, datetime.now())
 
 # ========== ESTADOS PARA CONVERSACIÓN ==========
 WAITING_FOR_VALUE = 1
@@ -67,17 +51,26 @@ async def fetch_json(session, url, headers=None, timeout=15):
     try:
         async with session.get(url, headers=headers, timeout=timeout) as resp:
             if resp.status == 200:
-                return await resp.json()
-            return {"error": f"HTTP {resp.status}"}
+                try:
+                    return await resp.json()
+                except:
+                    text = await resp.text()
+                    return {"error": f"Respuesta no JSON: {text[:100]}"}
+            else:
+                return {"error": f"HTTP {resp.status}"}
+    except asyncio.TimeoutError:
+        return {"error": "Timeout"}
     except Exception as e:
         return {"error": str(e)}
 
+# ---------- 1. Username (WhatsMyName) ----------
 async def api_username(username: str) -> dict:
     if not username:
         return {"error": "Usuario vacío"}
+    url = f"https://whatsmyname.app/api/v1/username?username={username}"
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; OSINTBot/1.0; +https://t.me/jsemanper)"}
     async with aiohttp.ClientSession() as session:
-        url = f"https://whatsmyname.app/api/v1/username?username={username}"
-        data = await fetch_json(session, url)
+        data = await fetch_json(session, url, headers=headers)
         if "error" in data:
             return data
         sites = data.get("sites", [])
@@ -85,23 +78,28 @@ async def api_username(username: str) -> dict:
             return {"status": "empty", "message": "No se encontraron resultados."}
         return {"status": "ok", "total": len(sites), "sites": sites[:50]}
 
+# ---------- 2. Email (EmailRep + HIBP) ----------
 async def api_email(email: str) -> dict:
     if not email:
         return {"error": "Correo vacío"}
     result = {}
     async with aiohttp.ClientSession() as session:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        if EMAILREP_KEY:
-            headers["X-API-Key"] = EMAILREP_KEY
+        # EmailRep
+        headers = {"User-Agent": "EmailRepBot/1.0"}
         url = f"https://emailrep.io/{email}"
-        resp = await fetch_json(session, url, headers=headers)
-        if "error" in resp:
-            result["emailrep_error"] = resp["error"]
+        data = await fetch_json(session, url, headers=headers)
+        if "error" in data:
+            result["emailrep_error"] = data["error"]
         else:
-            result["emailrep"] = resp
+            result["emailrep"] = data
 
         # HIBP
         hibp_headers = {"User-Agent": "Mozilla/5.0"}
+        if HIBP_API_KEY:
+            hibp_headers["hibp-api-key"] = HIBP_API_KEY
+        else:
+            result["hibp_error"] = "API key de HIBP no configurada (opcional)."
+            # Intentamos sin key (puede dar 401)
         url_hibp = f"https://haveibeenpwned.com/api/v3/breachedaccount/{email}"
         try:
             async with session.get(url_hibp, headers=hibp_headers, timeout=10) as r:
@@ -110,21 +108,25 @@ async def api_email(email: str) -> dict:
                     result["hibp"] = [b["Name"] for b in data]
                 elif r.status == 404:
                     result["hibp"] = []
+                elif r.status == 401:
+                    result["hibp_error"] = "401 - Necesitas una API key de HIBP (gratis en haveibeenpwned.com/API/Key)"
                 else:
                     result["hibp_error"] = f"Código {r.status}"
         except Exception as e:
             result["hibp_error"] = str(e)
     return result
 
+# ---------- 3. Teléfono (Numverify) ----------
 async def api_phone(phone: str) -> dict:
     if not NUMVERIFY_KEY:
-        return {"error": "API key de Numverify no configurada"}
+        return {"error": "API key de Numverify no configurada (gratis en numverify.com)"}
     if not phone:
         return {"error": "Número vacío"}
+    url = f"http://apilayer.net/api/validate?access_key={NUMVERIFY_KEY}&number={phone}"
     async with aiohttp.ClientSession() as session:
-        url = f"http://apilayer.net/api/validate?access_key={NUMVERIFY_KEY}&number={phone}"
         return await fetch_json(session, url)
 
+# ---------- 4. Dominio WHOIS ----------
 async def api_domain(domain: str) -> dict:
     if not domain:
         return {"error": "Dominio vacío"}
@@ -141,6 +143,7 @@ async def api_domain(domain: str) -> dict:
     except Exception as e:
         return {"error": str(e)}
 
+# ---------- 5. Portscan (síncrono pero adaptado) ----------
 async def api_portscan(host: str, port_range: str = None) -> dict:
     if not host:
         return {"error": "Host vacío"}
@@ -165,7 +168,6 @@ async def api_portscan(host: str, port_range: str = None) -> dict:
         except:
             return {"error": "Formato inválido"}
     open_ports = []
-    loop = asyncio.get_event_loop()
     for port in ports:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(0.5)
@@ -175,6 +177,7 @@ async def api_portscan(host: str, port_range: str = None) -> dict:
         sock.close()
     return {"host": host, "ip": ip, "open_ports": open_ports}
 
+# ---------- 6. Reputación IP (ip-api) ----------
 async def api_reputation(target: str) -> dict:
     if not target:
         return {"error": "Target vacío"}
@@ -186,10 +189,11 @@ async def api_reputation(target: str) -> dict:
             ip = socket.gethostbyname(target)
         except:
             return {"error": "No se pudo resolver"}
+    url = f"http://ip-api.com/json/{ip}"
     async with aiohttp.ClientSession() as session:
-        url = f"http://ip-api.com/json/{ip}"
         return await fetch_json(session, url)
 
+# ---------- 7. Metadatos desde archivo (se maneja aparte) ----------
 async def api_metadata_file(file_content: bytes, filename: str) -> dict:
     metadata = {"filename": filename, "size_bytes": len(file_content)}
     if filename.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".pdf")):
@@ -204,6 +208,7 @@ async def api_metadata_file(file_content: bytes, filename: str) -> dict:
             metadata["md5"] = "No se pudo leer (archivo binario)"
     return metadata
 
+# ---------- 8. Metadatos desde URL ----------
 async def api_metadata_url(url: str) -> dict:
     if not url:
         return {"error": "URL vacía"}
@@ -218,6 +223,7 @@ async def api_metadata_url(url: str) -> dict:
         except Exception as e:
             return {"error": str(e)}
 
+# ---------- 9. Hash ----------
 async def api_hash(hash_str: str) -> dict:
     if not hash_str:
         return {"error": "Hash vacío"}
@@ -232,26 +238,29 @@ async def api_hash(hash_str: str) -> dict:
         return {"error": "Longitud no reconocida"}
     return {"hash": hash_str, "type": htype, "message": "Solo identificación"}
 
+# ---------- 10. Shodan ----------
 async def api_shodan(query: str) -> dict:
     if not SHODAN_KEY:
-        return {"error": "Se requiere API key de Shodan"}
+        return {"error": "Se requiere API key de Shodan (gratis en shodan.io)"}
     if not query:
         return {"error": "Consulta vacía"}
+    url = f"https://api.shodan.io/shodan/host/{query}?key={SHODAN_KEY}"
     async with aiohttp.ClientSession() as session:
-        url = f"https://api.shodan.io/shodan/host/{query}?key={SHODAN_KEY}"
         return await fetch_json(session, url)
 
+# ---------- 11. Dork ----------
 async def api_dork(dork: str) -> dict:
     if not dork:
         return {"error": "Consulta vacía"}
     encoded = urllib.parse.quote(dork)
     return {"url": f"https://www.google.com/search?q={encoded}"}
 
+# ---------- 12. Bitcoin ----------
 async def api_bitcoin(address: str) -> dict:
     if not address:
         return {"error": "Dirección vacía"}
+    url = f"https://blockchain.info/rawaddr/{address}"
     async with aiohttp.ClientSession() as session:
-        url = f"https://blockchain.info/rawaddr/{address}"
         data = await fetch_json(session, url)
         if "error" in data:
             return data
@@ -263,6 +272,7 @@ async def api_bitcoin(address: str) -> dict:
             "n_tx": data.get("n_tx"),
         }
 
+# ---------- 13. Email Forensics ----------
 async def api_email_forensics(headers_text: str) -> dict:
     if not headers_text:
         return {"error": "Cabeceras vacías"}
@@ -274,12 +284,15 @@ async def api_email_forensics(headers_text: str) -> dict:
             parsed[key.lower()] = val
     return parsed
 
+# ---------- 14. Breach Check ----------
 async def api_breach(email: str) -> dict:
     if not email:
         return {"error": "Correo vacío"}
+    headers = {"User-Agent": "Mozilla/5.0"}
+    if HIBP_API_KEY:
+        headers["hibp-api-key"] = HIBP_API_KEY
+    url = f"https://haveibeenpwned.com/api/v3/breachedaccount/{email}"
     async with aiohttp.ClientSession() as session:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        url = f"https://haveibeenpwned.com/api/v3/breachedaccount/{email}"
         try:
             async with session.get(url, headers=headers, timeout=10) as r:
                 if r.status == 200:
@@ -288,18 +301,22 @@ async def api_breach(email: str) -> dict:
                     return {"email": email, "breaches": breaches}
                 elif r.status == 404:
                     return {"email": email, "breaches": []}
+                elif r.status == 401:
+                    return {"error": "401 - Necesitas API key de HIBP (gratis en haveibeenpwned.com/API/Key)"}
                 else:
-                    return {"error": f"Error {r.status}"}
+                    return {"error": f"Código {r.status}"}
         except Exception as e:
             return {"error": str(e)}
 
+# ---------- 15. IP Geolocation ----------
 async def api_ipgeo(ip: str) -> dict:
     if not ip:
         return {"error": "IP vacía"}
+    url = f"http://ip-api.com/json/{ip}"
     async with aiohttp.ClientSession() as session:
-        url = f"http://ip-api.com/json/{ip}"
         return await fetch_json(session, url)
 
+# ---------- 16. MAC Lookup ----------
 async def api_mac(mac: str) -> dict:
     if not mac:
         return {"error": "MAC vacía"}
@@ -307,8 +324,8 @@ async def api_mac(mac: str) -> dict:
     if len(mac) < 6:
         return {"error": "MAC demasiado corta"}
     prefix = mac[:6]
+    url = f"https://api.macvendors.com/{prefix}"
     async with aiohttp.ClientSession() as session:
-        url = f"https://api.macvendors.com/{prefix}"
         try:
             async with session.get(url, timeout=10) as r:
                 if r.status == 200:
@@ -319,11 +336,12 @@ async def api_mac(mac: str) -> dict:
         except Exception as e:
             return {"error": str(e)}
 
+# ---------- 17. Subdominios (crt.sh) ----------
 async def api_subdomains(domain: str) -> dict:
     if not domain:
         return {"error": "Dominio vacío"}
+    url = f"https://crt.sh/?q=%.{domain}&output=json"
     async with aiohttp.ClientSession() as session:
-        url = f"https://crt.sh/?q=%.{domain}&output=json"
         data = await fetch_json(session, url)
         if "error" in data:
             return data
@@ -336,20 +354,22 @@ async def api_subdomains(domain: str) -> dict:
                         subdomains.add(n.strip())
         return {"domain": domain, "subdomains": list(subdomains)[:100]}
 
+# ---------- 18. Reverse Image Search ----------
 async def api_reverse_image(image_url: str) -> dict:
     if not image_url:
         return {"error": "URL vacía"}
     encoded = urllib.parse.quote(image_url)
     return {"url": f"https://www.google.com/searchbyimage?image_url={encoded}"}
 
+# ---------- 19. Password Check (Pwned Passwords) ----------
 async def api_password_check(password: str) -> dict:
     if not password:
         return {"error": "Contraseña vacía"}
     sha1 = hashlib.sha1(password.encode()).hexdigest().upper()
     prefix = sha1[:5]
     suffix = sha1[5:]
+    url = f"https://api.pwnedpasswords.com/range/{prefix}"
     async with aiohttp.ClientSession() as session:
-        url = f"https://api.pwnedpasswords.com/range/{prefix}"
         try:
             async with session.get(url, timeout=10) as r:
                 if r.status == 200:
@@ -365,14 +385,15 @@ async def api_password_check(password: str) -> dict:
         except Exception as e:
             return {"error": str(e)}
 
+# ---------- 20. AI Threat (VirusTotal) ----------
 async def api_ai_threat(url: str) -> dict:
     if not VIRUSTOTAL_KEY:
-        return {"error": "Se requiere API key de VirusTotal"}
+        return {"error": "Se requiere API key de VirusTotal (gratis en virustotal.com)"}
     if not url:
         return {"error": "URL vacía"}
+    headers = {"x-apikey": VIRUSTOTAL_KEY}
+    data = {"url": url}
     async with aiohttp.ClientSession() as session:
-        headers = {"x-apikey": VIRUSTOTAL_KEY}
-        data = {"url": url}
         try:
             async with session.post("https://www.virustotal.com/api/v3/urls", headers=headers, data=data, timeout=15) as r:
                 if r.status == 200:
@@ -383,6 +404,7 @@ async def api_ai_threat(url: str) -> dict:
         except Exception as e:
             return {"error": str(e)}
 
+# ---------- 21. JS Secret Scanner ----------
 async def api_js_secrets(url: str) -> dict:
     if not url:
         return {"error": "URL vacía"}
@@ -407,17 +429,18 @@ async def api_js_secrets(url: str) -> dict:
         except Exception as e:
             return {"error": str(e)}
 
+# ---------- 22. Wayback ----------
 async def api_wayback(url: str) -> dict:
     if not url:
         return {"error": "URL vacía"}
+    full = f"https://archive.org/wayback/available?url={url}"
     async with aiohttp.ClientSession() as session:
-        full = f"https://archive.org/wayback/available?url={url}"
         return await fetch_json(session, full)
 
+# ---------- 23. Subdomain Takeover ----------
 async def api_takeover(domain: str) -> dict:
     if not domain:
         return {"error": "Dominio vacío"}
-    # Obtener subdominios
     sub_data = await api_subdomains(domain)
     if "error" in sub_data:
         return sub_data
@@ -434,6 +457,7 @@ async def api_takeover(domain: str) -> dict:
             pass
     return {"subdomains": subdomains[:50], "potential_takeover": vulnerable}
 
+# ---------- 24. Exposed Files ----------
 async def api_exposed_files(domain: str) -> dict:
     if not domain:
         return {"error": "Dominio vacío"}
@@ -454,6 +478,7 @@ async def api_exposed_files(domain: str) -> dict:
                 pass
     return {"exposed": found}
 
+# ---------- 25. Security Headers ----------
 async def api_security_headers(url: str) -> dict:
     if not url:
         return {"error": "URL vacía"}
@@ -475,18 +500,20 @@ async def api_security_headers(url: str) -> dict:
         except Exception as e:
             return {"error": str(e)}
 
+# ---------- 26. CVE Search ----------
 async def api_cve(keyword: str) -> dict:
     if not keyword:
         return {"error": "Palabra clave vacía"}
+    url = f"https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch={keyword}&resultsPerPage=20"
     async with aiohttp.ClientSession() as session:
-        url = f"https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch={keyword}&resultsPerPage=20"
         return await fetch_json(session, url)
 
+# ---------- 27. ASN Lookup ----------
 async def api_asn(ip: str) -> dict:
     if not ip:
         return {"error": "IP vacía"}
+    url = f"https://ipinfo.io/{ip}/json"
     async with aiohttp.ClientSession() as session:
-        url = f"https://ipinfo.io/{ip}/json"
         data = await fetch_json(session, url)
         if "error" in data:
             return data
@@ -496,6 +523,7 @@ async def api_asn(ip: str) -> dict:
             "country": data.get("country"),
         }
 
+# ---------- 28. S3 Bucket Finder ----------
 async def api_s3finder(company: str) -> dict:
     if not company:
         return {"error": "Nombre vacío"}
@@ -516,6 +544,7 @@ async def api_s3finder(company: str) -> dict:
                 pass
     return {"buckets": found}
 
+# ---------- 29. CORS Check ----------
 async def api_cors(url: str) -> dict:
     if not url:
         return {"error": "URL vacía"}
@@ -529,20 +558,23 @@ async def api_cors(url: str) -> dict:
         except Exception as e:
             return {"error": str(e)}
 
+# ---------- 30. GitHub Secrets ----------
 async def api_github_secrets(org: str) -> dict:
     if not GITHUB_TOKEN:
-        return {"error": "Se requiere GitHub token"}
+        return {"error": "Se requiere GitHub token (crea uno con permisos de búsqueda)"}
     if not org:
         return {"error": "Organización vacía"}
     headers = {
         "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "OSINTBot",
     }
     query = f"org:{org} extension:conf OR extension:env OR extension:key OR filename:.env"
+    url = f"https://api.github.com/search/code?q={query}"
     async with aiohttp.ClientSession() as session:
-        url = f"https://api.github.com/search/code?q={query}"
         return await fetch_json(session, url, headers=headers, timeout=30)
 
+# ---------- 31. Tech Detection ----------
 async def api_tech_detect(domain: str) -> dict:
     if not domain:
         return {"error": "Dominio vacío"}
@@ -574,41 +606,269 @@ async def api_tech_detect(domain: str) -> dict:
 
 # ========== FUNCIONES DEL BOT ==========
 
+def format_result(cmd_name, result):
+    """Convierte resultado a string formateado con HTML"""
+    if "error" in result:
+        return f"<b>Error en /{cmd_name}:</b>\n\n<code>{result['error']}</code>"
+    return f"<b>Resultado de /{cmd_name}:</b>\n\n<code>{json.dumps(result, indent=2, ensure_ascii=False)[:4000]}</code>"
+
+async def send_result(update, cmd_name, result):
+    await update.message.reply_text(
+        format_result(cmd_name, result),
+        parse_mode=ParseMode.HTML
+    )
+
+# Comandos directos
+async def cmd_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Uso: `/username <usuario>`", parse_mode=ParseMode.HTML)
+        return
+    value = " ".join(context.args)
+    result = await api_username(value)
+    await send_result(update, "username", result)
+
+async def cmd_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Uso: `/email <correo>`", parse_mode=ParseMode.HTML)
+        return
+    value = context.args[0]
+    result = await api_email(value)
+    await send_result(update, "email", result)
+
+async def cmd_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Uso: `/phone <número>`", parse_mode=ParseMode.HTML)
+        return
+    value = context.args[0]
+    result = await api_phone(value)
+    await send_result(update, "phone", result)
+
+async def cmd_domain(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Uso: `/domain <dominio>`", parse_mode=ParseMode.HTML)
+        return
+    value = context.args[0]
+    result = await api_domain(value)
+    await send_result(update, "domain", result)
+
+async def cmd_portscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Uso: `/portscan <host>` o `/portscan <host> 80-100`", parse_mode=ParseMode.HTML)
+        return
+    host = context.args[0]
+    port_range = context.args[1] if len(context.args) > 1 else None
+    result = await api_portscan(host, port_range)
+    await send_result(update, "portscan", result)
+
+async def cmd_reputation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Uso: `/reputation <ip/dominio>`", parse_mode=ParseMode.HTML)
+        return
+    value = context.args[0]
+    result = await api_reputation(value)
+    await send_result(update, "reputation", result)
+
+async def cmd_metadata_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Uso: `/metadata_url <url_imagen>`", parse_mode=ParseMode.HTML)
+        return
+    value = context.args[0]
+    result = await api_metadata_url(value)
+    await send_result(update, "metadata_url", result)
+
+async def cmd_hash(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Uso: `/hash <hash>`", parse_mode=ParseMode.HTML)
+        return
+    value = context.args[0]
+    result = await api_hash(value)
+    await send_result(update, "hash", result)
+
+async def cmd_shodan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Uso: `/shodan <ip>`", parse_mode=ParseMode.HTML)
+        return
+    value = context.args[0]
+    result = await api_shodan(value)
+    await send_result(update, "shodan", result)
+
+async def cmd_dork(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Uso: `/dork <consulta>`", parse_mode=ParseMode.HTML)
+        return
+    value = " ".join(context.args)
+    result = await api_dork(value)
+    await send_result(update, "dork", result)
+
+async def cmd_bitcoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Uso: `/bitcoin <dirección>`", parse_mode=ParseMode.HTML)
+        return
+    value = context.args[0]
+    result = await api_bitcoin(value)
+    await send_result(update, "bitcoin", result)
+
+async def cmd_breach(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Uso: `/breach <email>`", parse_mode=ParseMode.HTML)
+        return
+    value = context.args[0]
+    result = await api_breach(value)
+    await send_result(update, "breach", result)
+
+async def cmd_ipgeo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Uso: `/ipgeo <ip>`", parse_mode=ParseMode.HTML)
+        return
+    value = context.args[0]
+    result = await api_ipgeo(value)
+    await send_result(update, "ipgeo", result)
+
+async def cmd_mac(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Uso: `/mac <mac>`", parse_mode=ParseMode.HTML)
+        return
+    value = context.args[0]
+    result = await api_mac(value)
+    await send_result(update, "mac", result)
+
+async def cmd_subdomains(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Uso: `/subdomains <dominio>`", parse_mode=ParseMode.HTML)
+        return
+    value = context.args[0]
+    result = await api_subdomains(value)
+    await send_result(update, "subdomains", result)
+
+async def cmd_reverse_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Uso: `/reverse_image <url>`", parse_mode=ParseMode.HTML)
+        return
+    value = context.args[0]
+    result = await api_reverse_image(value)
+    await send_result(update, "reverse_image", result)
+
+async def cmd_password_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Uso: `/password_check <contraseña>`", parse_mode=ParseMode.HTML)
+        return
+    value = context.args[0]
+    result = await api_password_check(value)
+    await send_result(update, "password_check", result)
+
+async def cmd_ai_threat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Uso: `/ai_threat <url>`", parse_mode=ParseMode.HTML)
+        return
+    value = context.args[0]
+    result = await api_ai_threat(value)
+    await send_result(update, "ai_threat", result)
+
+async def cmd_js_secrets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Uso: `/js_secrets <url>`", parse_mode=ParseMode.HTML)
+        return
+    value = context.args[0]
+    result = await api_js_secrets(value)
+    await send_result(update, "js_secrets", result)
+
+async def cmd_wayback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Uso: `/wayback <url>`", parse_mode=ParseMode.HTML)
+        return
+    value = context.args[0]
+    result = await api_wayback(value)
+    await send_result(update, "wayback", result)
+
+async def cmd_takeover(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Uso: `/takeover <dominio>`", parse_mode=ParseMode.HTML)
+        return
+    value = context.args[0]
+    result = await api_takeover(value)
+    await send_result(update, "takeover", result)
+
+async def cmd_exposed_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Uso: `/exposed_files <dominio>`", parse_mode=ParseMode.HTML)
+        return
+    value = context.args[0]
+    result = await api_exposed_files(value)
+    await send_result(update, "exposed_files", result)
+
+async def cmd_security_headers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Uso: `/security_headers <url>`", parse_mode=ParseMode.HTML)
+        return
+    value = context.args[0]
+    result = await api_security_headers(value)
+    await send_result(update, "security_headers", result)
+
+async def cmd_cve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Uso: `/cve <palabra>`", parse_mode=ParseMode.HTML)
+        return
+    value = " ".join(context.args)
+    result = await api_cve(value)
+    await send_result(update, "cve", result)
+
+async def cmd_asn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Uso: `/asn <ip>`", parse_mode=ParseMode.HTML)
+        return
+    value = context.args[0]
+    result = await api_asn(value)
+    await send_result(update, "asn", result)
+
+async def cmd_s3finder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Uso: `/s3finder <empresa>`", parse_mode=ParseMode.HTML)
+        return
+    value = context.args[0]
+    result = await api_s3finder(value)
+    await send_result(update, "s3finder", result)
+
+async def cmd_cors(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Uso: `/cors <url>`", parse_mode=ParseMode.HTML)
+        return
+    value = context.args[0]
+    result = await api_cors(value)
+    await send_result(update, "cors", result)
+
+async def cmd_github_secrets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Uso: `/github_secrets <organización>`", parse_mode=ParseMode.HTML)
+        return
+    value = context.args[0]
+    result = await api_github_secrets(value)
+    await send_result(update, "github_secrets", result)
+
+async def cmd_tech_detect(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Uso: `/tech_detect <dominio>`", parse_mode=ParseMode.HTML)
+        return
+    value = context.args[0]
+    result = await api_tech_detect(value)
+    await send_result(update, "tech_detect", result)
+
+async def cmd_email_forensics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Uso: `/email_forensics <cabeceras>` (múltiples líneas)", parse_mode=ParseMode.HTML)
+        return
+    value = " ".join(context.args)
+    result = await api_email_forensics(value)
+    await send_result(update, "email_forensics", result)
+
+# ========== MENÚ Y CONVERSACIÓN ==========
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "🕵️ *Bot OSINT - Herramientas de inteligencia de fuentes abiertas*\n\n"
-        "Usa `/menu` para ver las opciones interactivas.\n"
-        "O escribe directamente un comando:\n"
-        "`/search <usuario>`\n"
-        "`/email <correo>`\n"
-        "`/phone <número>`\n"
-        "`/domain <dominio>`\n"
-        "`/portscan <host>`\n"
-        "`/reputation <ip/dominio>`\n"
-        "`/hash <hash>`\n"
-        "`/shodan <ip>`\n"
-        "`/dork <consulta>`\n"
-        "`/bitcoin <dirección>`\n"
-        "`/breach <email>`\n"
-        "`/ipgeo <ip>`\n"
-        "`/mac <mac>`\n"
-        "`/subdomains <dominio>`\n"
-        "`/reverse_image <url>`\n"
-        "`/password <contraseña>`\n"
-        "`/ai_threat <url>`\n"
-        "`/js_secrets <url>`\n"
-        "`/wayback <url>`\n"
-        "`/takeover <dominio>`\n"
-        "`/exposed <dominio>`\n"
-        "`/security_headers <url>`\n"
-        "`/cve <palabra>`\n"
-        "`/asn <ip>`\n"
-        "`/s3finder <empresa>`\n"
-        "`/cors <url>`\n"
-        "`/github_secrets <organización>`\n"
-        "`/tech_detect <dominio>`\n\n"
-        "También puedes enviar un archivo (imagen, PDF, etc.) para obtener metadatos.",
-        parse_mode=ParseMode.MARKDOWN,
+        "🕵️ <b>Bot OSINT - Herramientas de inteligencia de fuentes abiertas</b>\n\n"
+        "Usa /menu para ver las opciones interactivas.\n"
+        "O escribe directamente un comando (ej. /email correo@ejemplo.com).\n\n"
+        "📌 <i>Algunos comandos requieren API keys (las verás en el menú).</i>",
+        parse_mode=ParseMode.HTML,
     )
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -619,7 +879,6 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         [InlineKeyboardButton("🌐 Dominio WHOIS", callback_data="domain")],
         [InlineKeyboardButton("🔌 Portscan", callback_data="portscan")],
         [InlineKeyboardButton("⚡ Reputación", callback_data="reputation")],
-        [InlineKeyboardButton("🖼️ Metadatos (archivo)", callback_data="metadata_file")],
         [InlineKeyboardButton("🖼️ Metadatos (URL)", callback_data="metadata_url")],
         [InlineKeyboardButton("🔐 Hash", callback_data="hash")],
         [InlineKeyboardButton("🔎 Shodan", callback_data="shodan")],
@@ -643,60 +902,34 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         [InlineKeyboardButton("🔗 CORS", callback_data="cors")],
         [InlineKeyboardButton("🔑 GitHub Secrets", callback_data="github_secrets")],
         [InlineKeyboardButton("🌡️ Tech Detect", callback_data="tech_detect")],
+        [InlineKeyboardButton("✉️ Email Forensics", callback_data="email_forensics")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("📋 *Elige una herramienta:*", reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text("📋 <b>Elige una herramienta:</b>", reply_markup=reply_markup, parse_mode=ParseMode.HTML)
 
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     command = query.data
-    # Guardar el comando en user_data para la conversación
     context.user_data["command"] = command
-    # Dependiendo del comando, pedir el valor correspondiente
-    if command == "metadata_file":
-        await query.edit_message_text("📤 Envía un archivo (imagen, PDF, texto, etc.) y te extraeré los metadatos.")
-        return WAITING_FOR_VALUE
-    else:
-        prompt = f"✏️ Escribe el valor para `/{command}`:"
-        await query.edit_message_text(prompt, parse_mode=ParseMode.MARKDOWN)
-        return WAITING_FOR_VALUE
+    prompt = f"✏️ Escribe el valor para <b>/</b><code>{command}</code> (o /cancel para cancelar):"
+    await query.edit_message_text(prompt, parse_mode=ParseMode.HTML)
+    return WAITING_FOR_VALUE
 
 async def handle_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # Recibir el valor escrito por el usuario
     value = update.message.text.strip()
     command = context.user_data.get("command")
     if not command:
-        await update.message.reply_text("❌ No se qué herramienta usar. Usa /menu.")
+        await update.message.reply_text("❌ No sé qué herramienta usar. Usa /menu.", parse_mode=ParseMode.HTML)
         return ConversationHandler.END
 
-    # Ejecutar la función correspondiente
-    result = await execute_command(command, value, update.message)
-    await update.message.reply_text(f"*Resultado de /{command}:*\n\n{json.dumps(result, indent=2, ensure_ascii=False)[:4000]}", parse_mode=ParseMode.MARKDOWN)
-    context.user_data.pop("command", None)
-    return ConversationHandler.END
-
-async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Manejar archivos para metadata
-    document = update.message.document or update.message.photo
-    if not document:
-        await update.message.reply_text("❌ No se detectó archivo.")
-        return
-    # Descargar archivo
-    file = await document.get_file()
-    file_content = await file.download_as_bytearray()
-    filename = document.file_name if hasattr(document, "file_name") else "archivo.jpg"
-    result = await api_metadata_file(file_content, filename)
-    await update.message.reply_text(f"📊 *Metadatos del archivo:*\n\n{json.dumps(result, indent=2, ensure_ascii=False)}", parse_mode=ParseMode.MARKDOWN)
-
-async def execute_command(command: str, value: str, update_obj=None) -> dict:
     # Mapeo de comandos a funciones
     func_map = {
         "username": api_username,
         "email": api_email,
         "phone": api_phone,
         "domain": api_domain,
-        "portscan": api_portscan,
+        "portscan": lambda v: api_portscan(v, None),
         "reputation": api_reputation,
         "metadata_url": api_metadata_url,
         "hash": api_hash,
@@ -724,80 +957,35 @@ async def execute_command(command: str, value: str, update_obj=None) -> dict:
         "email_forensics": api_email_forensics,
     }
     if command not in func_map:
-        return {"error": "Comando no reconocido"}
-    try:
-        return await func_map[command](value)
-    except Exception as e:
-        return {"error": str(e)}
+        await update.message.reply_text("❌ Comando no reconocido.", parse_mode=ParseMode.HTML)
+        return ConversationHandler.END
 
-# Handlers para comandos directos (con argumentos)
-async def cmd_username(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.message.reply_text("❌ Uso: `/username <usuario>`", parse_mode=ParseMode.MARKDOWN)
+    result = await func_map[command](value)
+    await update.message.reply_text(
+        format_result(command, result),
+        parse_mode=ParseMode.HTML
+    )
+    context.user_data.pop("command", None)
+    return ConversationHandler.END
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("❌ Operación cancelada.", parse_mode=ParseMode.HTML)
+    return ConversationHandler.END
+
+# ========== MANEJO DE ARCHIVOS ==========
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    document = update.message.document or update.message.photo[-1] if update.message.photo else None
+    if not document:
+        await update.message.reply_text("❌ No se detectó archivo.", parse_mode=ParseMode.HTML)
         return
-    value = " ".join(context.args)
-    result = await api_username(value)
-    await update.message.reply_text(f"🔍 *Resultado de username:*\n\n{json.dumps(result, indent=2, ensure_ascii=False)[:4000]}", parse_mode=ParseMode.MARKDOWN)
-
-async def cmd_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.message.reply_text("❌ Uso: `/email <correo>`", parse_mode=ParseMode.MARKDOWN)
-        return
-    value = context.args[0]
-    result = await api_email(value)
-    await update.message.reply_text(f"📧 *Resultado de email:*\n\n{json.dumps(result, indent=2, ensure_ascii=False)[:4000]}", parse_mode=ParseMode.MARKDOWN)
-
-async def cmd_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.message.reply_text("❌ Uso: `/phone <número>`", parse_mode=ParseMode.MARKDOWN)
-        return
-    value = context.args[0]
-    result = await api_phone(value)
-    await update.message.reply_text(f"📞 *Resultado de phone:*\n\n{json.dumps(result, indent=2, ensure_ascii=False)[:4000]}", parse_mode=ParseMode.MARKDOWN)
-
-# Repetir para todos los comandos (usaré un generador dinámico)
-def make_cmd_handler(func, cmd_name):
-    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not context.args:
-            await update.message.reply_text(f"❌ Uso: `/{cmd_name} <valor>`", parse_mode=ParseMode.MARKDOWN)
-            return
-        value = " ".join(context.args)
-        result = await func(value)
-        await update.message.reply_text(f"*Resultado de /{cmd_name}:*\n\n{json.dumps(result, indent=2, ensure_ascii=False)[:4000]}", parse_mode=ParseMode.MARKDOWN)
-    return handler
-
-# Mapeo de comandos directos
-direct_commands = [
-    ("username", api_username),
-    ("email", api_email),
-    ("phone", api_phone),
-    ("domain", api_domain),
-    ("portscan", api_portscan),
-    ("reputation", api_reputation),
-    ("metadata_url", api_metadata_url),
-    ("hash", api_hash),
-    ("shodan", api_shodan),
-    ("dork", api_dork),
-    ("bitcoin", api_bitcoin),
-    ("breach", api_breach),
-    ("ipgeo", api_ipgeo),
-    ("mac", api_mac),
-    ("subdomains", api_subdomains),
-    ("reverse_image", api_reverse_image),
-    ("password_check", api_password_check),
-    ("ai_threat", api_ai_threat),
-    ("js_secrets", api_js_secrets),
-    ("wayback", api_wayback),
-    ("takeover", api_takeover),
-    ("exposed_files", api_exposed_files),
-    ("security_headers", api_security_headers),
-    ("cve", api_cve),
-    ("asn", api_asn),
-    ("s3finder", api_s3finder),
-    ("cors", api_cors),
-    ("github_secrets", api_github_secrets),
-    ("tech_detect", api_tech_detect),
-]
+    file = await document.get_file()
+    file_content = await file.download_as_bytearray()
+    filename = document.file_name if hasattr(document, "file_name") else "archivo.jpg"
+    result = await api_metadata_file(file_content, filename)
+    await update.message.reply_text(
+        f"<b>Metadatos del archivo:</b>\n\n<code>{json.dumps(result, indent=2, ensure_ascii=False)}</code>",
+        parse_mode=ParseMode.HTML
+    )
 
 # ========== MAIN ==========
 
@@ -806,32 +994,58 @@ def main() -> None:
 
     # Conversación para menú interactivo
     conv_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(button_callback, pattern="^(username|email|phone|domain|portscan|reputation|metadata_file|metadata_url|hash|shodan|dork|bitcoin|breach|ipgeo|mac|subdomains|reverse_image|password_check|ai_threat|js_secrets|wayback|takeover|exposed_files|security_headers|cve|asn|s3finder|cors|github_secrets|tech_detect)$")],
+        entry_points=[CallbackQueryHandler(button_callback, pattern="^(username|email|phone|domain|portscan|reputation|metadata_url|hash|shodan|dork|bitcoin|breach|ipgeo|mac|subdomains|reverse_image|password_check|ai_threat|js_secrets|wayback|takeover|exposed_files|security_headers|cve|asn|s3finder|cors|github_secrets|tech_detect|email_forensics)$")],
         states={
             WAITING_FOR_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_value)],
         },
-        fallbacks=[CommandHandler("cancel", lambda u, c: u.message.reply_text("❌ Cancelado."))],
+        fallbacks=[CommandHandler("cancel", cancel)],
     )
     application.add_handler(conv_handler)
 
     # Comandos directos
-    for cmd, func in direct_commands:
-        application.add_handler(CommandHandler(cmd, make_cmd_handler(func, cmd)))
+    application.add_handler(CommandHandler("username", cmd_username))
+    application.add_handler(CommandHandler("email", cmd_email))
+    application.add_handler(CommandHandler("phone", cmd_phone))
+    application.add_handler(CommandHandler("domain", cmd_domain))
+    application.add_handler(CommandHandler("portscan", cmd_portscan))
+    application.add_handler(CommandHandler("reputation", cmd_reputation))
+    application.add_handler(CommandHandler("metadata_url", cmd_metadata_url))
+    application.add_handler(CommandHandler("hash", cmd_hash))
+    application.add_handler(CommandHandler("shodan", cmd_shodan))
+    application.add_handler(CommandHandler("dork", cmd_dork))
+    application.add_handler(CommandHandler("bitcoin", cmd_bitcoin))
+    application.add_handler(CommandHandler("breach", cmd_breach))
+    application.add_handler(CommandHandler("ipgeo", cmd_ipgeo))
+    application.add_handler(CommandHandler("mac", cmd_mac))
+    application.add_handler(CommandHandler("subdomains", cmd_subdomains))
+    application.add_handler(CommandHandler("reverse_image", cmd_reverse_image))
+    application.add_handler(CommandHandler("password_check", cmd_password_check))
+    application.add_handler(CommandHandler("ai_threat", cmd_ai_threat))
+    application.add_handler(CommandHandler("js_secrets", cmd_js_secrets))
+    application.add_handler(CommandHandler("wayback", cmd_wayback))
+    application.add_handler(CommandHandler("takeover", cmd_takeover))
+    application.add_handler(CommandHandler("exposed_files", cmd_exposed_files))
+    application.add_handler(CommandHandler("security_headers", cmd_security_headers))
+    application.add_handler(CommandHandler("cve", cmd_cve))
+    application.add_handler(CommandHandler("asn", cmd_asn))
+    application.add_handler(CommandHandler("s3finder", cmd_s3finder))
+    application.add_handler(CommandHandler("cors", cmd_cors))
+    application.add_handler(CommandHandler("github_secrets", cmd_github_secrets))
+    application.add_handler(CommandHandler("tech_detect", cmd_tech_detect))
+    application.add_handler(CommandHandler("email_forensics", cmd_email_forensics))
 
-    # Comandos especiales
+    # Comandos de inicio y menú
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("menu", menu))
-    application.add_handler(CommandHandler("email_forensics", make_cmd_handler(api_email_forensics, "email_forensics")))
 
     # Manejo de archivos
     application.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_file))
 
-    # Manejo de comandos desconocidos
+    # Comandos desconocidos
     async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("❌ Comando no reconocido. Usa /menu.")
+        await update.message.reply_text("❌ Comando no reconocido. Usa /menu.", parse_mode=ParseMode.HTML)
     application.add_handler(MessageHandler(filters.COMMAND, unknown))
 
-    # Iniciar
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
